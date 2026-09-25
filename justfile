@@ -2,7 +2,7 @@ set shell := ["bash", "-e", "-u", "-o", "pipefail", "-c"]
 
 export RUST_BACKTRACE := 'full'
 
-[group("z")]
+[private]
 @def:
   just -l
 
@@ -15,10 +15,20 @@ fmt:
 test:
   cargo test
 
-build: fmt
-  cargo build
-
-clippy: fmt build
+clippy: fmt
   cargo clippy
+
+build:
+  cargo build
+alias b := build
+
+build-release: fmt clippy test
+  cargo build --release
+alias l := build-release
+
+run *args:
+  cargo run -- {{ args }}
+alias r := run
+
 
 

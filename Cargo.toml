@@ -13,6 +13,11 @@ repository = "https://gitlab.com/hkoosha/expandem"
 [lints.clippy]
 needless_return = "allow"
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
 [profile.dev]
 opt-level = 1
 codegen-units = 256

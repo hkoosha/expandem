@@ -197,7 +197,7 @@ mod internal {
 
             let mut output = self.output();
             for it in edits {
-                eprintln!("{:?}", it);
+                trace!("{:?}", it);
                 output.replace_range(it.to_range(), &it.replacement);
             }
 
@@ -397,7 +397,7 @@ mod internal {
             root: &SyntaxNode,
             attribute_ranges: &[TextRange],
         ) -> Result<Vec<Edit>, ExpandemError> {
-            eprintln!("derive edits...");
+            trace!("derive edits...");
 
             let mut edits = Vec::new();
 
@@ -732,12 +732,11 @@ options:
       --skip-build-scripts       skip running Cargo for discovering build-script output and proc macros.
       --skip-proc-macros         do not start the proc-macro server or expand procedural macros.
       --proc-macro-srv <PATH>    path to rust-analyzer's proc-macro server.
-  -h, --help                     print help.
-";
+  -h, --help                     print help.";
 
     fn help_text(bin_name: Option<&str>) -> String {
         format!(
-            "the following required argument was not provided: <SOURCE>\n\n{} {} {}",
+            "{} {} {}",
             HELP_PREFIX,
             bin_name.unwrap_or("expandem"),
             HELP_SUFFIX
