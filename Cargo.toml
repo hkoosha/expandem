@@ -2,7 +2,7 @@
 name = "expandem"
 version = "0.1.0"
 authors = ["Koosha H <git@koosha.io>"]
-license = "AGPL3"
+license = "AGPL-3.0-only"
 description = "Selective macro expansion powered by rust-analyzer"
 edition = "2024"
 homepage = "https://koosha.io/project/expandem"
