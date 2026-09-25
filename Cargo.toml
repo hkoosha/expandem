@@ -7,8 +7,7 @@ description = "Selective macro expansion powered by rust-analyzer"
 edition = "2024"
 homepage = "https://koosha.io/project/expandem"
 repository = "https://gitlab.com/hkoosha/expandem"
-#keywords = [""]
-#categories = [""]
+categories = ["compilers", "development-tools::procedural-macro-helpers"]
 
 [lints.clippy]
 needless_return = "allow"
