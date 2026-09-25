@@ -90,8 +90,8 @@ mod internal {
         Vfs,
         VfsPath,
     };
-use std::fs;
-use std::ops::Range;
+    use std::fs;
+    use std::ops::Range;
 
     fn sub(it: impl Display) -> String {
         let max = 30;
@@ -379,7 +379,7 @@ use std::ops::Range;
                 );
             }
 
-            let mut output = expanded.to_string();
+            let mut output = output.text().to_string();
             for replacement in edits {
                 output.replace_range(
                     usize::from(replacement.range.start())
@@ -415,7 +415,6 @@ use std::ops::Range;
 
                 item
                     .attrs()
-                    .into_iter()
                     .filter_map(|it| {
                         it.meta().map(|meta| (meta, it.syntax().text_range()))
                     })
@@ -446,7 +445,7 @@ use std::ops::Range;
                                         .get(*index)
                                         .map(|it| self.origin(*it))
                                         .unwrap_or(MacroOrigin::Other);
-                                    self.selects(&entry, origin)
+                                    self.selects(entry, origin)
                                 })
                                 .map(|(index, _)| index)
                                 .collect::<Vec<_>>(),
@@ -670,7 +669,6 @@ use std::ops::Range;
         {
             let name = token_tree
                 .token_trees_and_tokens()
-                .into_iter()
                 .flat_map(|it| match it {
                     NodeOrToken::Token(token) => Some(token),
                     _ => None,
@@ -790,7 +788,7 @@ options:
                     proc_macro_srv = Some(PathBuf::from(val));
                 }
                 _ if arg.starts_with("--proc-macro-srv=") => {
-                    let val = arg.splitn(2, '=').nth(1).unwrap();
+                    let val = arg.split_once('=').unwrap().1;
                     proc_macro_srv = Some(PathBuf::from(val));
                 }
                 _ => return Err((format!("unexpected argument '{arg}'"), 2)),
@@ -883,7 +881,7 @@ mod failure {
         ) -> std::fmt::Result {
             match self {
                 ExpandemError::ExpandemError(it) => write!(f, "{}", it),
-                ExpandemError::Other(it) => write!(f, "{}", &*it),
+                ExpandemError::Other(it) => write!(f, "{}", it),
             }
         }
     }
