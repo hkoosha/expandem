@@ -1,6 +1,6 @@
 [package]
 name = "expandem"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Koosha H <git@koosha.io>"]
 license = "AGPL-3.0-only"
 description = "Selective macro expansion powered by rust-analyzer"
