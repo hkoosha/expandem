@@ -41,3 +41,8 @@ options:
       --proc-macro-srv <PATH>    path to rust-analyzer's proc-macro server.
   -h, --help                     print help.
 ```
+
+TODO:
+
+- Currently if a procedural macro is consumed by another one, the later ones
+  are not dropped from the output as they should be.
