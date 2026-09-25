@@ -1,4 +1,4 @@
-# expandem
+# Expandem
 
 A command-line tool to expand selected Rust macros. It uses rust-analyzer behind
 the scene.

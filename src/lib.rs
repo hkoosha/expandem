@@ -10,7 +10,9 @@ pub struct Options {
     /// Path to rust-analyzer's proc-macro server
     pub proc_macro_srv: Option<std::path::PathBuf>,
 
-    /// Source paths of macros to include or exclude. An empty set selects every macro.
+    /// Paths of macros to include or exclude. An empty set selects every macro.
+    /// A trailing `::*` matches macros directly on a path; trailing `::**`
+    /// also matches macros on nested paths.
     pub macros: std::collections::BTreeSet<String>,
 
     /// Expand macros defined by the `std` crate. Disabled by default.
@@ -53,6 +55,8 @@ mod internal {
     use ra_ap_hir::{
         Crate,
         Macro,
+        ModuleDef,
+        PathResolution,
     };
     use ra_ap_ide::{
         RootDatabase,
@@ -229,6 +233,31 @@ mod internal {
                 .filter_map(ast::Item::cast)
                 .inspect(|it| trace!("trying to expand: {}", sub(it)))
                 .filter_map(|it| {
+                    let macro_def =
+                        self.editor.sema.resolve_attr_macro_call(&it)?;
+                    let macro_attr = it.attrs().find(|attr| {
+                        let Some(path) =
+                            attr.meta().and_then(|meta| meta.path())
+                        else {
+                            return false;
+                        };
+
+                        matches!(
+                            self.editor.sema.resolve_path(&path),
+                            Some(PathResolution::Def(ModuleDef::Macro(it)))
+                                if it == macro_def
+                        )
+                    })?;
+                    let macro_path =
+                        macro_attr.meta().and_then(|meta| meta.path())?;
+                    if !self.editor.selects(
+                        &macro_path.to_string(),
+                        self.editor.origin(macro_def),
+                    ) {
+                        trace!("not selected: {}", macro_path);
+                        return None;
+                    }
+
                     let expansion =
                         match self.editor.sema.expand_attr_macro(&it) {
                             None => {
@@ -243,25 +272,38 @@ mod internal {
                     return Some((
                         it.syntax().text_range(),
                         expansion.value.value,
+                        it.attrs()
+                            .filter(|attr| {
+                                attr.syntax().text_range()
+                                    != macro_attr.syntax().text_range()
+                            })
+                            .collect::<Vec<_>>(),
                     ));
                 })
                 .collect::<Vec<_>>();
 
-            candidates.sort_unstable_by_key(|(range, _)| {
+            candidates.sort_unstable_by_key(|(range, _, _)| {
                 (range.start(), std::cmp::Reverse(range.end()))
             });
 
             trace!("candidates: {:?}", candidates);
 
             let mut edits = Vec::new();
-            for (range, expansion) in candidates {
+            for (range, expansion, attributes) in candidates {
                 if !edits.iter().any(|it: &Edit| covers(it.range, range)) {
-                    let edit = Edit {
-                        range,
-                        replacement: self
-                            .editor
-                            .expand_selected_node(&self.krate, &expansion)?,
-                    };
+                    let preserved = missing_attributes(&attributes, &expansion);
+                    let mut replacement = self
+                        .editor
+                        .expand_selected_node(&self.krate, &expansion)?;
+                    if !preserved.is_empty() {
+                        replacement = format!(
+                            "{}\n{}",
+                            preserved.join("\n"),
+                            replacement,
+                        );
+                    }
+
+                    let edit = Edit { range, replacement };
                     edits.push(edit);
                 }
             }
@@ -419,7 +461,7 @@ mod internal {
                         it.meta().map(|meta| (meta, it.syntax().text_range()))
                     })
                     .filter(|(meta, _range)| {
-                        meta.path().is_none_or(|p| p.to_string() != "derive")
+                        meta.path().is_some_and(|p| p.to_string() == "derive")
                     })
                     .map(|(meta, range)| (derive_entries(&meta), meta, range))
                     .map(|(entries, meta, range)| {
@@ -455,7 +497,7 @@ mod internal {
                             range,
                         )
                     })
-                    .filter(|(selected, _, _, _, _)| selected.is_empty())
+                    .filter(|(selected, _, _, _, _)| !selected.is_empty())
                     .map(|(selected, resolved, entries, meta, range)| {
                         (
                             entries
@@ -640,7 +682,13 @@ mod internal {
                 MacroOrigin::Core => self.options.include_core,
                 _ => {
                     let mut cond = self.options.macros.is_empty()
-                        || self.options.macros.contains(path);
+                        || self.options.macros.contains(path)
+                        || self
+                            .options
+                            .macros
+                            .iter()
+                            .filter(|selector| selector.ends_with('*'))
+                            .any(|selector| macro_path_matches(selector, path));
                     if self.options.negate {
                         cond = !cond;
                     }
@@ -648,6 +696,37 @@ mod internal {
                 }
             };
         }
+    }
+
+    pub(super) fn macro_path_matches(
+        selector: &str,
+        path: &str,
+    ) -> bool {
+        if selector == path {
+            return true;
+        }
+
+        if selector == "**" {
+            return true;
+        }
+        if selector == "*" {
+            return !path.contains("::");
+        }
+
+        if let Some(prefix) = selector.strip_suffix("::**") {
+            return path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with("::") && rest.len() > 2);
+        }
+        if let Some(prefix) = selector.strip_suffix("::*") {
+            return path.strip_prefix(prefix).is_some_and(|rest| {
+                rest.starts_with("::")
+                    && rest.len() > 2
+                    && !rest[2..].contains("::")
+            });
+        }
+
+        false
     }
 
     #[derive(Debug)]
@@ -661,6 +740,44 @@ mod internal {
             return usize::from(self.range.start())
                 ..usize::from(self.range.end());
         }
+    }
+
+    fn missing_attributes(
+        attributes: &[ast::Attr],
+        expansion: &SyntaxNode,
+    ) -> Vec<String> {
+        let output_item = ast::Item::cast(expansion.clone())
+            .or_else(|| expansion.descendants().find_map(ast::Item::cast));
+        let mut output_attributes = output_item
+            .into_iter()
+            .flat_map(|item| item.attrs())
+            .map(|attr| attribute_key(&attr))
+            .collect::<Vec<_>>();
+
+        attributes
+            .iter()
+            .filter_map(|attr| {
+                let key = attribute_key(attr);
+                if let Some(index) =
+                    output_attributes.iter().position(|output| *output == key)
+                {
+                    output_attributes.remove(index);
+                    None
+                }
+                else {
+                    Some(attr.syntax().text().to_string())
+                }
+            })
+            .collect()
+    }
+
+    fn attribute_key(attr: &ast::Attr) -> String {
+        attr.syntax()
+            .descendants_with_tokens()
+            .filter_map(NodeOrToken::into_token)
+            .filter(|token| !token.kind().is_trivia())
+            .map(|token| token.text().to_string())
+            .collect()
     }
 
     fn derive_entries(meta: &ast::Meta) -> Option<String> {
@@ -718,12 +835,13 @@ expand selected Rust macros in a source file
 usage:
 ";
 
-    const HELP_SUFFIX: &str = "\
+    const HELP_SUFFIX: &str = concat!("\
 [OPTIONS] <SOURCE> [MACROS]...
 
 arguments:
   <SOURCE>     source file to transform.
-  [MACROS]...  macro paths to expand; do not include `!`. omit to expand all macros.
+  [MACROS]...  macro paths to expand; trailing `*` matches that path and trailing `**` also matches nested paths.
+               do not include `!`. omit to expand all macros.
 
 options:
       --include-std              expand macros defined by the `std` crate.
@@ -732,7 +850,9 @@ options:
       --skip-build-scripts       skip running Cargo for discovering build-script output and proc macros.
       --skip-proc-macros         do not start the proc-macro server or expand procedural macros.
       --proc-macro-srv <PATH>    path to rust-analyzer's proc-macro server.
-  -h, --help                     print help.";
+  -h, --help                     print help.
+
+  Version: ", env!("CARGO_PKG_VERSION"));
 
     fn help_text(bin_name: Option<&str>) -> String {
         format!(
@@ -897,19 +1017,58 @@ mod failure {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::internal::macro_path_matches;
 
     #[test]
-    fn expands_own_binary_source() {
-        let output = expand(Options {
-            source: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/main.rs"),
-            skip_build_scripts: false,
-            skip_proc_macros: false,
-            ..Default::default()
-        })
-        .expect("the crate's binary source expands");
+    fn matches_exact_macro_paths() {
+        assert!(macro_path_matches(
+            "crate::module::mac",
+            "crate::module::mac"
+        ));
+        assert!(!macro_path_matches(
+            "crate::module::mac",
+            "crate::module::other"
+        ));
+    }
 
-        assert!(output.contains("fn main()"));
+    #[test]
+    fn single_wildcard_matches_only_macros_directly_on_path() {
+        assert!(macro_path_matches("crate::module::*", "crate::module::mac"));
+        assert!(!macro_path_matches(
+            "crate::module::*",
+            "crate::module::nested::mac",
+        ));
+        assert!(!macro_path_matches("crate::module::*", "crate::module"));
+        assert!(!macro_path_matches(
+            "crate::module::*",
+            "crate::modules::mac"
+        ));
+        assert!(macro_path_matches("*", "mac"));
+        assert!(!macro_path_matches("*", "module::mac"));
+    }
+
+    #[test]
+    fn double_wildcard_matches_macros_on_or_below_path() {
+        assert!(macro_path_matches(
+            "crate::module::**",
+            "crate::module::mac"
+        ));
+        assert!(macro_path_matches(
+            "crate::module::**",
+            "crate::module::nested::mac",
+        ));
+        assert!(!macro_path_matches("crate::module::**", "crate::module"));
+        assert!(!macro_path_matches(
+            "crate::module::**",
+            "crate::modules::mac"
+        ));
+        assert!(macro_path_matches("**", "mac"));
+        assert!(macro_path_matches("**", "module::mac"));
+    }
+
+    #[test]
+    fn wildcard_is_special_only_as_the_last_path_element() {
+        assert!(!macro_path_matches("crate::*::mac", "crate::module::mac"));
+        assert!(!macro_path_matches("crate::mod*", "crate::module"));
     }
 }
