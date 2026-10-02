@@ -274,8 +274,20 @@ mod internal {
                         expansion.value.value,
                         it.attrs()
                             .filter(|attr| {
-                                attr.syntax().text_range()
-                                    != macro_attr.syntax().text_range()
+                                if attr.syntax().text_range()
+                                    == macro_attr.syntax().text_range()
+                                {
+                                    return false;
+                                }
+                                let Some(path) = attr.meta().and_then(|meta| meta.path()) else {
+                                    return true;
+                                };
+                                let Some(PathResolution::Def(ModuleDef::Macro(def))) =
+                                    self.editor.sema.resolve_path(&path)
+                                else {
+                                    return true;
+                                };
+                                !self.editor.selects(&path.to_string(), self.editor.origin(def))
                             })
                             .collect::<Vec<_>>(),
                     ));
@@ -815,7 +827,7 @@ mod internal {
 
     fn is_disjoint(edits: &[Edit]) -> bool {
         for pair in edits.windows(2) {
-            if pair[1].range.start() < pair[0].range.end() {
+            if pair[1].range.end() > pair[0].range.start() {
                 return false;
             }
         }
