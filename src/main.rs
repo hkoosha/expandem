@@ -11,7 +11,7 @@ fn main() {
     let mut args = std::env::args();
     let bin = args.next();
 
-    let options = match parse_options(bin, args) {
+    let options = match parse_options(bin.as_deref(), args) {
         Ok(it) => it,
         Err((stderr, exit_code)) => {
             eprintln!("{stderr}");

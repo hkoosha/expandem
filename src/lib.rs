@@ -2,7 +2,12 @@
 
 pub use failure::ExpandemError;
 
-#[derive(Debug, Clone, Default)]
+#[cfg(test)]
+mod tests;
+
+const DEFAULT_MAX_EXPANSION_DEPTH: usize = 128;
+
+#[derive(Debug, Clone)]
 pub struct Options {
     /// Source file to transform.
     pub source: std::path::PathBuf,
@@ -30,6 +35,9 @@ pub struct Options {
 
     /// Skip starting a proc-macro server and loading procedural macros.
     pub skip_proc_macros: bool,
+
+    /// Maximum nesting depth of selected macro expansions.
+    pub max_depth: usize,
 }
 
 pub fn expand(it: Options) -> Result<String, ExpandemError> {
@@ -37,7 +45,7 @@ pub fn expand(it: Options) -> Result<String, ExpandemError> {
 }
 
 pub fn parse_options(
-    bin_name: Option<String>,
+    bin_name: Option<&str>,
     args: impl Iterator<Item = String>,
 ) -> Result<Options, (String, i32)> {
     return args::parse(bin_name, args);
@@ -97,7 +105,7 @@ mod internal {
     use std::fs;
     use std::ops::Range;
 
-    fn sub(it: impl Display) -> String {
+    fn substr(it: impl Display) -> String {
         let max = 30;
 
         let it = it.to_string();
@@ -167,7 +175,13 @@ mod internal {
             let root = self.root();
             let syntax = root.syntax();
 
-            let attribute_edits = self.selected_attribute_edits(syntax)?;
+            let attribute_edits = selected_attribute_edits(
+                &self.editor,
+                &self.krate,
+                syntax,
+                syntax,
+                0,
+            )?;
 
             let ranges = attribute_edits
                 .iter()
@@ -178,6 +192,7 @@ mod internal {
                 &self.krate,
                 syntax,
                 &ranges,
+                0,
             )?;
 
             let function_edits = self.editor.outermost_selected_calls_edits(
@@ -185,6 +200,7 @@ mod internal {
                 syntax,
                 syntax,
                 ranges,
+                0,
             )?;
 
             let mut edits = attribute_edits;
@@ -222,108 +238,134 @@ mod internal {
             trace!("reading file: {:?}", self.file_id);
             return self.editor.sema.parse_guess_edition(self.file_id);
         }
+    }
 
-        fn selected_attribute_edits(
-            &self,
-            root: &SyntaxNode,
-        ) -> Result<Vec<Edit>, ExpandemError> {
-            trace!("finding edit candidates");
-            let mut candidates = root
-                .descendants()
-                .filter_map(ast::Item::cast)
-                .inspect(|it| trace!("trying to expand: {}", sub(it)))
-                .filter_map(|it| {
-                    let macro_def =
-                        self.editor.sema.resolve_attr_macro_call(&it)?;
-                    let macro_attr = it.attrs().find(|attr| {
-                        let Some(path) =
-                            attr.meta().and_then(|meta| meta.path())
-                        else {
-                            return false;
-                        };
+    fn selected_attribute_edits(
+        editor: &Editor<'_>,
+        krate: &Crate,
+        semantic_root: &SyntaxNode,
+        output_root: &SyntaxNode,
+        depth: usize,
+    ) -> Result<Vec<Edit>, ExpandemError> {
+        trace!("finding edit candidates");
+        let mut output_items =
+            output_root.descendants().filter_map(ast::Item::cast);
+        let mut candidates = Vec::new();
 
-                        matches!(
-                            self.editor.sema.resolve_path(&path),
-                            Some(PathResolution::Def(ModuleDef::Macro(it)))
-                                if it == macro_def
-                        )
-                    })?;
-                    let macro_path =
-                        macro_attr.meta().and_then(|meta| meta.path())?;
-                    if !self.editor.selects(
-                        &macro_path.to_string(),
-                        self.editor.origin(macro_def),
-                    ) {
-                        trace!("not selected: {}", macro_path);
-                        return None;
+        for item in semantic_root.descendants().filter_map(ast::Item::cast) {
+            trace!("trying to expand: {}", substr(&item));
+            let output_item = output_items.next().ok_or_else(|| {
+                ExpandemError::of_str(
+                    "macro expansion prettification changed item structure",
+                )
+            })?;
+
+            let m_def = match editor.sema.resolve_attr_macro_call(&item) {
+                Some(it) => it,
+                None => continue,
+            };
+
+            let m_attr = match item.attrs().find(|attr| {
+                let Some(path) = attr.meta().and_then(|meta| meta.path())
+                else {
+                    return false;
+                };
+
+                matches!(
+                    editor.sema.resolve_path(&path),
+                    Some(PathResolution::Def(ModuleDef::Macro(it)))
+                        if it == m_def
+                )
+            }) {
+                Some(it) => it,
+                None => continue,
+            };
+
+            let m_path = match m_attr.meta().and_then(|meta| meta.path()) {
+                Some(it) => it,
+                None => continue,
+            };
+
+            if !editor.selects(&m_path.to_string(), editor.origin(m_def)) {
+                trace!("not selected: {}", m_path);
+                continue;
+            }
+
+            let expansion = match editor.sema.expand_attr_macro(&item) {
+                None => {
+                    trace!("did not expand: {}", substr(&item));
+                    continue;
+                }
+                Some(it) => it,
+            };
+
+            if let Some(err) = expansion.err {
+                warn!("expansion error: {:?}", err);
+            }
+
+            let attributes = item
+                .attrs()
+                .filter(|it| {
+                    if it.syntax().text_range() == m_attr.syntax().text_range()
+                    {
+                        return false;
                     }
 
-                    let expansion =
-                        match self.editor.sema.expand_attr_macro(&it) {
-                            None => {
-                                trace!("did not expand: {}", sub(&it));
-                                return None;
-                            }
-                            Some(it) => it,
-                        };
-                    if let Some(err) = expansion.err {
-                        warn!("expansion error: {:?}", err);
-                    }
-                    return Some((
-                        it.syntax().text_range(),
-                        expansion.value.value,
-                        it.attrs()
-                            .filter(|attr| {
-                                if attr.syntax().text_range()
-                                    == macro_attr.syntax().text_range()
-                                {
-                                    return false;
-                                }
-                                let Some(path) = attr.meta().and_then(|meta| meta.path()) else {
-                                    return true;
-                                };
-                                let Some(PathResolution::Def(ModuleDef::Macro(def))) =
-                                    self.editor.sema.resolve_path(&path)
-                                else {
-                                    return true;
-                                };
-                                !self.editor.selects(&path.to_string(), self.editor.origin(def))
-                            })
-                            .collect::<Vec<_>>(),
-                    ));
+                    let Some(path) = it.meta().and_then(|meta| meta.path())
+                    else {
+                        return true;
+                    };
+
+                    let Some(PathResolution::Def(ModuleDef::Macro(def))) =
+                        editor.sema.resolve_path(&path)
+                    else {
+                        return false;
+                    };
+
+                    !editor.selects(&path.to_string(), editor.origin(def))
                 })
                 .collect::<Vec<_>>();
 
-            candidates.sort_unstable_by_key(|(range, _, _)| {
-                (range.start(), std::cmp::Reverse(range.end()))
-            });
-
-            trace!("candidates: {:?}", candidates);
-
-            let mut edits = Vec::new();
-            for (range, expansion, attributes) in candidates {
-                if !edits.iter().any(|it: &Edit| covers(it.range, range)) {
-                    let preserved = missing_attributes(&attributes, &expansion);
-                    let mut replacement = self
-                        .editor
-                        .expand_selected_node(&self.krate, &expansion)?;
-                    if !preserved.is_empty() {
-                        replacement = format!(
-                            "{}\n{}",
-                            preserved.join("\n"),
-                            replacement,
-                        );
-                    }
-
-                    let edit = Edit { range, replacement };
-                    edits.push(edit);
-                }
-            }
-
-            trace!("edits: {:?}", edits);
-
-            Ok(edits)
+            candidates.push((
+                output_item.syntax().text_range(),
+                expansion.value.value,
+                attributes,
+                editor.next_level(depth)?,
+            ));
         }
+
+        if output_items.next().is_some() {
+            return ExpandemError::fail(
+                "macro expansion prettification changed item structure",
+            );
+        }
+
+        candidates.sort_unstable_by_key(|(range, _, _, _)| {
+            (range.start(), std::cmp::Reverse(range.end()))
+        });
+
+        trace!("candidates: {:?}", candidates);
+
+        let mut edits = Vec::new();
+        for (range, expansion, attributes, expansion_depth) in candidates {
+            if !edits.iter().any(|it: &Edit| covers(it.range, range)) {
+                let preserved = missing_attributes(&attributes, &expansion);
+                let mut replacement = editor.expand_selected_node(
+                    krate,
+                    &expansion,
+                    expansion_depth,
+                )?;
+                if !preserved.is_empty() {
+                    replacement =
+                        format!("{}\n{}", preserved.join("\n"), replacement);
+                }
+
+                edits.push(Edit { range, replacement });
+            }
+        }
+
+        trace!("edits: {:?}", edits);
+        return Ok(edits);
     }
 
     impl Workspace {
@@ -395,10 +437,26 @@ mod internal {
 
     //noinspection DuplicatedCode
     impl Editor<'_> {
+        fn next_level(
+            &self,
+            depth: usize,
+        ) -> Result<usize, ExpandemError> {
+            let next = depth.checked_add(1).unwrap();
+            if next > self.options.max_depth {
+                return ExpandemError::fail(format!(
+                    "macro expansion depth exceeds the configured limit of {}",
+                    self.options.max_depth,
+                ));
+            }
+
+            return Ok(next);
+        }
+
         fn expand_selected_node(
             &self,
             krate: &Crate,
             expanded: &SyntaxNode,
+            depth: usize,
         ) -> Result<String, ExpandemError> {
             trace!("loading HIR: {expanded}");
 
@@ -417,20 +475,24 @@ mod internal {
                 })
                 .unwrap_or_else(|| expanded.clone());
 
-            let mut edits = self.outermost_selected_calls_edits(
+            let mut edits = selected_attribute_edits(
+                self, krate, expanded, &output, depth,
+            )?;
+            let attribute_ranges =
+                edits.iter().map(|edit| edit.range).collect::<Vec<_>>();
+            edits.extend(self.outermost_selected_calls_edits(
                 krate,
                 expanded,
                 &output,
-                vec![],
-            )?;
+                attribute_ranges,
+                depth,
+            )?);
 
             edits.sort_unstable_by_key(|edit| {
                 std::cmp::Reverse((edit.range.start(), edit.range.end()))
             });
             if !is_disjoint(&edits) {
-                return ExpandemError::fail(
-                    "selected macro expansions overlap",
-                );
+                return ExpandemError::fail("macro expansions overlap");
             }
 
             let mut output = output.text().to_string();
@@ -450,6 +512,7 @@ mod internal {
             krate: &Crate,
             root: &SyntaxNode,
             attribute_ranges: &[TextRange],
+            depth: usize,
         ) -> Result<Vec<Edit>, ExpandemError> {
             trace!("derive edits...");
 
@@ -509,7 +572,7 @@ mod internal {
                             range,
                         )
                     })
-                    .filter(|(selected, _, _, _, _)| !selected.is_empty())
+                    .filter(|(it, ..)| !it.is_empty())
                     .map(|(selected, resolved, entries, meta, range)| {
                         (
                             entries
@@ -553,6 +616,7 @@ mod internal {
                                 generated.push(self.expand_selected_node(
                                     krate,
                                     &expansion.value,
+                                    self.next_level(depth)?,
                                 )?);
                             }
 
@@ -588,6 +652,7 @@ mod internal {
             semantic_node: &SyntaxNode,
             output_node: &SyntaxNode,
             attribute_ranges: Vec<TextRange>,
+            depth: usize,
         ) -> Result<Vec<Edit>, ExpandemError> {
             trace!(
                 "outermost_selected_calls_edits: crate={:?}, node={:?}, attribute={:?}",
@@ -646,6 +711,7 @@ mod internal {
                                 )
                             })?
                             .value,
+                        self.next_level(depth)?,
                     )?,
                 });
             }
@@ -837,12 +903,15 @@ mod internal {
 }
 
 mod args {
-    use super::Options;
+    use super::{
+        DEFAULT_MAX_EXPANSION_DEPTH,
+        Options,
+    };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     const HELP_PREFIX: &str = "\
-expand selected Rust macros in a source file
+expand Rust macros
 
 usage:
 ";
@@ -859,9 +928,10 @@ options:
       --include-std              expand macros defined by the `std` crate.
       --include-core             expand macros defined by the `core` crate.
   -n, --negate                   treat MACROS as exclusions rather than inclusions.
-      --skip-build-scripts       skip running Cargo for discovering build-script output and proc macros.
-      --skip-proc-macros         do not start the proc-macro server or expand procedural macros.
+      --skip-build-scripts       skip running build.rs scripts and proc macros.
+      --skip-proc-macros         do not start the proc-macro server or expand proc macros.
       --proc-macro-srv <PATH>    path to rust-analyzer's proc-macro server.
+      --max-depth <N>            maximum expansion depth.
   -h, --help                     print help.
 
   Version: ", env!("CARGO_PKG_VERSION"));
@@ -876,17 +946,21 @@ options:
     }
 
     pub(super) fn parse(
-        bin_name: Option<String>,
+        bin_name: Option<&str>,
         args: impl Iterator<Item = String>,
     ) -> Result<Options, (String, i32)> {
-        let mut source: Option<PathBuf> = None;
-        let mut macros: BTreeSet<String> = BTreeSet::new();
-        let mut include_std = false;
-        let mut include_core = false;
-        let mut negate = false;
-        let mut skip_build_scripts = false;
-        let mut skip_proc_macros = false;
-        let mut proc_macro_srv: Option<PathBuf> = None;
+        let mut source = None;
+        let mut this = Options {
+            source: "/".into(),
+            macros: BTreeSet::new(),
+            include_std: false,
+            include_core: false,
+            negate: false,
+            skip_build_scripts: false,
+            skip_proc_macros: false,
+            proc_macro_srv: None,
+            max_depth: DEFAULT_MAX_EXPANSION_DEPTH,
+        };
 
         let mut positional_only = false;
         let mut args = args.peekable();
@@ -897,59 +971,62 @@ options:
                     source = Some(PathBuf::from(arg));
                 }
                 else {
-                    macros.insert(arg);
+                    this.macros.insert(arg);
                 }
                 continue;
             }
 
             match arg.as_str() {
+                "-h" | "--help" => return Err((help_text(bin_name), 0)),
                 "--" => positional_only = true,
-                "-h" | "--help" => {
-                    return Err((help_text(bin_name.as_deref()), 0));
-                }
-                "--include-std" => include_std = true,
-                "--include-core" => include_core = true,
-                "-n" | "--negate" => negate = true,
-                "--skip-build-scripts" => skip_build_scripts = true,
-                "--skip-proc-macros" => skip_proc_macros = true,
+                "--include-std" => this.include_std = true,
+                "--include-core" => this.include_core = true,
+                "-n" | "--negate" => this.negate = true,
+                "--skip-build-scripts" => this.skip_build_scripts = true,
+                "--skip-proc-macros" => this.skip_proc_macros = true,
                 "--proc-macro-srv" => {
                     let val = args.next().ok_or_else(|| {
                         ("--proc-macro-srv requires a value".to_string(), 2)
                     })?;
-                    proc_macro_srv = Some(PathBuf::from(val));
+                    this.proc_macro_srv = Some(PathBuf::from(val));
                 }
-                _ if arg.starts_with("--proc-macro-srv=") => {
-                    let val = arg.split_once('=').unwrap().1;
-                    proc_macro_srv = Some(PathBuf::from(val));
+                "--max-depth" => {
+                    let val = args.next().ok_or_else(|| {
+                        ("--max-depth requires a value".to_string(), 2)
+                    })?;
+                    this.max_depth = val
+                        .parse()
+                        .map(|it| match it {
+                            0 => usize::MAX,
+                            _ => it,
+                        })
+                        .map_err(|_| {
+                            (
+                                "--max-depth must be a non-negative integer"
+                                    .to_string(),
+                                2,
+                            )
+                        })?;
                 }
                 _ => return Err((format!("unexpected argument '{arg}'"), 2)),
             }
         }
 
-        let source = source.ok_or_else(|| {
+        this.source = source.ok_or_else(|| {
             (format!(
                 "the following required argument was not provided: <SOURCE>\n\n{}",
-                help_text(bin_name.as_deref())
+                help_text(bin_name)
             ), 2)
         })?;
 
-        if let Some(bad) = macros.iter().find(|it| it.ends_with('!')) {
+        if let Some(bad) = this.macros.iter().find(|it| it.ends_with('!')) {
             return Err((
                 format!("macro paths must not end with `!`: {bad}"),
                 2,
             ));
         }
 
-        Ok(Options {
-            source,
-            macros,
-            include_std,
-            include_core,
-            negate,
-            skip_build_scripts,
-            skip_proc_macros,
-            proc_macro_srv,
-        })
+        return Ok(this);
     }
 }
 
@@ -1024,63 +1101,5 @@ mod failure {
                 Self::Other(error) => Some(error.as_ref()),
             };
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::internal::macro_path_matches;
-
-    #[test]
-    fn matches_exact_macro_paths() {
-        assert!(macro_path_matches(
-            "crate::module::mac",
-            "crate::module::mac"
-        ));
-        assert!(!macro_path_matches(
-            "crate::module::mac",
-            "crate::module::other"
-        ));
-    }
-
-    #[test]
-    fn single_wildcard_matches_only_macros_directly_on_path() {
-        assert!(macro_path_matches("crate::module::*", "crate::module::mac"));
-        assert!(!macro_path_matches(
-            "crate::module::*",
-            "crate::module::nested::mac",
-        ));
-        assert!(!macro_path_matches("crate::module::*", "crate::module"));
-        assert!(!macro_path_matches(
-            "crate::module::*",
-            "crate::modules::mac"
-        ));
-        assert!(macro_path_matches("*", "mac"));
-        assert!(!macro_path_matches("*", "module::mac"));
-    }
-
-    #[test]
-    fn double_wildcard_matches_macros_on_or_below_path() {
-        assert!(macro_path_matches(
-            "crate::module::**",
-            "crate::module::mac"
-        ));
-        assert!(macro_path_matches(
-            "crate::module::**",
-            "crate::module::nested::mac",
-        ));
-        assert!(!macro_path_matches("crate::module::**", "crate::module"));
-        assert!(!macro_path_matches(
-            "crate::module::**",
-            "crate::modules::mac"
-        ));
-        assert!(macro_path_matches("**", "mac"));
-        assert!(macro_path_matches("**", "module::mac"));
-    }
-
-    #[test]
-    fn wildcard_is_special_only_as_the_last_path_element() {
-        assert!(!macro_path_matches("crate::*::mac", "crate::module::mac"));
-        assert!(!macro_path_matches("crate::mod*", "crate::module"));
     }
 }
