@@ -17,6 +17,9 @@ expandem path/to/source.rs my_crate::some_macro
 
 # Expand std macros too
 expandem path/to/source.rs --include-std
+
+# Simplify literal `if true` branches in the expanded output
+expandem path/to/source.rs --fix
 ```
 
 Usage:
@@ -39,10 +42,11 @@ options:
       --skip-build-scripts       skip running Cargo for discovering build-script output and proc macros.
       --skip-proc-macros         do not start the proc-macro server or expand procedural macros.
       --proc-macro-srv <PATH>    path to rust-analyzer's proc-macro server.
+      --fix                      apply rust-analyzer fixes to expanded output.
   -h, --help                     print help.
 ```
 
 TODO:
 
-- Currently if a procedural macro is consumed by another one, the later ones
-  are not dropped from the output as they should be.
+- Currently if a procedural macro is consumed by another one, the later ones are
+  not dropped from the output as they should be.

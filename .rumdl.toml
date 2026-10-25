@@ -1,0 +1,18 @@
+[global]
+# extend-enable  = []
+# extend-disable = []
+# disable = []
+# enable  = []
+# include = []
+# exclude = []
+
+flavor = "standard"
+respect-gitignore = true
+
+[MD007]
+indent = 2
+
+[MD013]
+line-length = 80
+reflow = true
+reflow-mode = "normalize"

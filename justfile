@@ -10,13 +10,14 @@ clean:
   cargo clean
 
 fmt:
+  rumdl fmt --deny-config-warnings --no-cache *.md
   cargo fmt
 
 test:
   cargo test
 
 clippy: fmt
-  cargo clippy
+  cargo clippy --offline --frozen
 
 build:
   cargo build
@@ -29,6 +30,4 @@ alias l := build-release
 run *args:
   cargo run -- {{ args }}
 alias r := run
-
-
 

@@ -36,6 +36,9 @@ pub struct Options {
     /// Skip starting a proc-macro server and loading procedural macros.
     pub skip_proc_macros: bool,
 
+    /// Apply rust-analyzer fixes to the expanded output.
+    pub fix: bool,
+
     /// Maximum nesting depth of selected macro expansions.
     pub max_depth: usize,
 }
@@ -65,16 +68,30 @@ mod internal {
         Macro,
         ModuleDef,
         PathResolution,
+        PrefixKind,
     };
     use ra_ap_ide::{
+        Analysis,
+        AssistConfig,
+        AssistKind,
+        AssistResolveStrategy,
+        DiagnosticsConfig,
+        Edition,
+        ExprFillDefaultMode,
+        FileRange,
         RootDatabase,
         Semantics,
+        TextEdit,
         TextRange,
     };
     use ra_ap_ide_db::base_db::{
         CrateOrigin,
         LangCrateOrigin,
         SourceDatabase,
+    };
+    use ra_ap_ide_db::imports::insert_use::{
+        ImportGranularity,
+        InsertUseConfig,
     };
     use ra_ap_ide_db::syntax_helpers::prettify_macro_expansion;
     use ra_ap_load_cargo::{
@@ -149,6 +166,7 @@ mod internal {
         editor: Editor<'db>,
         file_id: FileId,
         krate: Crate,
+        proc_macro_cwd: AbsPathBuf,
     }
 
     impl<'db> Context<'db> {
@@ -168,6 +186,11 @@ mod internal {
                 editor,
                 file_id,
                 krate,
+                proc_macro_cwd: workspace
+                    .source
+                    .parent()
+                    .unwrap()
+                    .to_path_buf(),
             });
         }
 
@@ -221,6 +244,12 @@ mod internal {
                 output.replace_range(it.to_range(), &it.replacement);
             }
 
+            if self.editor.options.fix {
+                return unwrap_literal_true_branches(
+                    output,
+                    self.proc_macro_cwd.clone(),
+                );
+            }
             return Ok(output);
         }
 
@@ -237,6 +266,119 @@ mod internal {
         fn root(&self) -> SourceFile {
             trace!("reading file: {:?}", self.file_id);
             return self.editor.sema.parse_guess_edition(self.file_id);
+        }
+    }
+
+    pub(super) fn unwrap_literal_true_branches(
+        mut output: String,
+        proc_macro_cwd: AbsPathBuf,
+    ) -> Result<String, ExpandemError> {
+        let insert_use = InsertUseConfig {
+            granularity: ImportGranularity::Crate,
+            enforce_granularity: true,
+            prefix_kind: PrefixKind::Plain,
+            group: true,
+            skip_glob_imports: true,
+        };
+        let assist_config = AssistConfig {
+            snippet_cap: None,
+            allowed: Some(vec![AssistKind::RefactorRewrite]),
+            insert_use,
+            prefer_no_std: false,
+            prefer_prelude: true,
+            prefer_absolute: false,
+            assist_emit_must_use: false,
+            term_search_fuel: 400,
+            code_action_grouping: false,
+            expr_fill_default: ExprFillDefaultMode::Todo,
+            prefer_self_ty: false,
+            show_rename_conflicts: false,
+        };
+        let diagnostics_config = DiagnosticsConfig {
+            enabled: false,
+            proc_macros_enabled: false,
+            proc_attr_macros_enabled: false,
+            disable_experimental: true,
+            disabled: Default::default(),
+            expr_fill_default: ExprFillDefaultMode::Todo,
+            style_lints: false,
+            snippet_cap: None,
+            insert_use,
+            prefer_no_std: false,
+            prefer_prelude: true,
+            prefer_absolute: false,
+            term_search_fuel: 0,
+            show_rename_conflicts: false,
+        };
+
+        loop {
+            let parsed = SourceFile::parse(&output, Edition::CURRENT);
+            let offsets = parsed
+                .tree()
+                .syntax()
+                .descendants()
+                .filter_map(ast::IfExpr::cast)
+                .filter(|if_expr| {
+                    matches!(
+                        if_expr.condition(),
+                        Some(ast::Expr::Literal(literal))
+                            if literal.syntax().text() == "true"
+                    )
+                })
+                .filter_map(|if_expr| {
+                    if_expr
+                        .then_branch()
+                        .and_then(|branch| branch.stmt_list())
+                        .and_then(|statements| statements.l_curly_token())
+                        .map(|token| token.text_range().end())
+                })
+                .collect::<Vec<_>>();
+
+            if offsets.is_empty() {
+                return Ok(output);
+            }
+
+            let (analysis, file_id) = Analysis::from_single_file(
+                output.clone(),
+                proc_macro_cwd.clone().into(),
+            );
+            let mut combined_edit = TextEdit::default();
+            let mut changed = false;
+
+            for offset in offsets {
+                let edit = analysis
+                    .assists_with_fixes(
+                        &assist_config,
+                        &diagnostics_config,
+                        AssistResolveStrategy::All,
+                        FileRange {
+                            file_id,
+                            range: TextRange::empty(offset),
+                        },
+                    )
+                    .map_err(ExpandemError::wrap)?
+                    .into_iter()
+                    .find(|assist| assist.id.0 == "unwrap_branch")
+                    .and_then(|assist| assist.source_change)
+                    .and_then(|change| {
+                        change
+                            .get_source_and_snippet_edit(file_id)
+                            .map(|(edit, _)| edit.clone())
+                    });
+
+                let Some(edit) = edit
+                else {
+                    continue;
+                };
+                if combined_edit.union(edit).is_ok() {
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                return Ok(output);
+            }
+            combined_edit.apply(&mut output);
         }
     }
 
@@ -931,6 +1073,7 @@ options:
       --skip-build-scripts       skip running build.rs scripts and proc macros.
       --skip-proc-macros         do not start the proc-macro server or expand proc macros.
       --proc-macro-srv <PATH>    path to rust-analyzer's proc-macro server.
+      --fix                      apply rust-analyzer fixes to expanded output.
       --max-depth <N>            maximum expansion depth.
   -h, --help                     print help.
 
@@ -958,6 +1101,7 @@ options:
             negate: false,
             skip_build_scripts: false,
             skip_proc_macros: false,
+            fix: false,
             proc_macro_srv: None,
             max_depth: DEFAULT_MAX_EXPANSION_DEPTH,
         };
@@ -984,6 +1128,7 @@ options:
                 "-n" | "--negate" => this.negate = true,
                 "--skip-build-scripts" => this.skip_build_scripts = true,
                 "--skip-proc-macros" => this.skip_proc_macros = true,
+                "--fix" => this.fix = true,
                 "--proc-macro-srv" => {
                     let val = args.next().ok_or_else(|| {
                         ("--proc-macro-srv requires a value".to_string(), 2)
