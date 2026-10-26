@@ -1,6 +1,6 @@
 [package]
 name = "expandem"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Koosha H <git@koosha.io>"]
 license = "AGPL-3.0-only"
 description = "Selective macro expansion powered by rust-analyzer"
@@ -34,3 +34,6 @@ ra_ap_load-cargo = "0.0.358"
 ra_ap_project_model = "0.0.358"
 ra_ap_syntax = "0.0.358"
 ra_ap_vfs = "0.0.358"
+
+[dev-dependencies]
+ra_ap_test_fixture = "0.0.358"

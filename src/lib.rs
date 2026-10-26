@@ -36,7 +36,7 @@ pub struct Options {
     /// Skip starting a proc-macro server and loading procedural macros.
     pub skip_proc_macros: bool,
 
-    /// Apply rust-analyzer fixes to the expanded output.
+    /// Simplify constant branches, redundant parentheses, and path prefixes.
     pub fix: bool,
 
     /// Maximum nesting depth of selected macro expansions.
@@ -68,17 +68,9 @@ mod internal {
         Macro,
         ModuleDef,
         PathResolution,
-        PrefixKind,
     };
     use ra_ap_ide::{
-        Analysis,
-        AssistConfig,
-        AssistKind,
-        AssistResolveStrategy,
-        DiagnosticsConfig,
         Edition,
-        ExprFillDefaultMode,
-        FileRange,
         RootDatabase,
         Semantics,
         TextEdit,
@@ -89,11 +81,10 @@ mod internal {
         LangCrateOrigin,
         SourceDatabase,
     };
-    use ra_ap_ide_db::imports::insert_use::{
-        ImportGranularity,
-        InsertUseConfig,
+    use ra_ap_ide_db::syntax_helpers::{
+        LexedStr,
+        prettify_macro_expansion,
     };
-    use ra_ap_ide_db::syntax_helpers::prettify_macro_expansion;
     use ra_ap_load_cargo::{
         LoadCargoConfig,
         ProcMacroServerChoice,
@@ -108,9 +99,11 @@ mod internal {
         NodeOrToken,
         SourceFile,
         SyntaxNode,
+        SyntaxToken,
         ast::{
             self,
             HasAttrs,
+            HasGenericArgs,
         },
     };
     use ra_ap_vfs::{
@@ -136,16 +129,27 @@ mod internal {
 
     pub(crate) fn expand(options: Options) -> Result<String, ExpandemError> {
         trace!("creating workspace");
-        let workspace = Workspace::load(options)?;
+        let mut workspace = Workspace::load(options)?;
 
-        trace!("creating editor");
-        let editor = workspace.editor();
+        let (output, file_id) = {
+            trace!("creating editor");
+            let editor = workspace.editor();
 
-        trace!("opening context");
-        let ctx = Context::new(&workspace, editor)?;
+            trace!("opening context");
+            let ctx = Context::new(&workspace, editor)?;
 
-        trace!("ekran...");
-        return ctx.ekran();
+            trace!("ekran...");
+            (ctx.ekran()?, ctx.file_id)
+        };
+        if workspace.options.fix {
+            let output = simplify_syntax(output);
+            return Ok(simplify_path_prefixes(
+                output,
+                &mut workspace.db,
+                file_id,
+            ));
+        }
+        return Ok(output);
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -166,7 +170,6 @@ mod internal {
         editor: Editor<'db>,
         file_id: FileId,
         krate: Crate,
-        proc_macro_cwd: AbsPathBuf,
     }
 
     impl<'db> Context<'db> {
@@ -186,11 +189,6 @@ mod internal {
                 editor,
                 file_id,
                 krate,
-                proc_macro_cwd: workspace
-                    .source
-                    .parent()
-                    .unwrap()
-                    .to_path_buf(),
             });
         }
 
@@ -244,12 +242,6 @@ mod internal {
                 output.replace_range(it.to_range(), &it.replacement);
             }
 
-            if self.editor.options.fix {
-                return unwrap_literal_true_branches(
-                    output,
-                    self.proc_macro_cwd.clone(),
-                );
-            }
             return Ok(output);
         }
 
@@ -269,117 +261,248 @@ mod internal {
         }
     }
 
-    pub(super) fn unwrap_literal_true_branches(
-        mut output: String,
-        proc_macro_cwd: AbsPathBuf,
-    ) -> Result<String, ExpandemError> {
-        let insert_use = InsertUseConfig {
-            granularity: ImportGranularity::Crate,
-            enforce_granularity: true,
-            prefix_kind: PrefixKind::Plain,
-            group: true,
-            skip_glob_imports: true,
-        };
-        let assist_config = AssistConfig {
-            snippet_cap: None,
-            allowed: Some(vec![AssistKind::RefactorRewrite]),
-            insert_use,
-            prefer_no_std: false,
-            prefer_prelude: true,
-            prefer_absolute: false,
-            assist_emit_must_use: false,
-            term_search_fuel: 400,
-            code_action_grouping: false,
-            expr_fill_default: ExprFillDefaultMode::Todo,
-            prefer_self_ty: false,
-            show_rename_conflicts: false,
-        };
-        let diagnostics_config = DiagnosticsConfig {
-            enabled: false,
-            proc_macros_enabled: false,
-            proc_attr_macros_enabled: false,
-            disable_experimental: true,
-            disabled: Default::default(),
-            expr_fill_default: ExprFillDefaultMode::Todo,
-            style_lints: false,
-            snippet_cap: None,
-            insert_use,
-            prefer_no_std: false,
-            prefer_prelude: true,
-            prefer_absolute: false,
-            term_search_fuel: 0,
-            show_rename_conflicts: false,
-        };
+    pub(super) fn simplify_syntax(output: String) -> String {
+        let output = remove_redundant_parentheses(output);
+        let output = unwrap_literal_true_branches(output);
+        return remove_redundant_parentheses(output);
+    }
 
+    pub(super) fn remove_redundant_parentheses(mut output: String) -> String {
         loop {
             let parsed = SourceFile::parse(&output, Edition::CURRENT);
-            let offsets = parsed
-                .tree()
-                .syntax()
-                .descendants()
-                .filter_map(ast::IfExpr::cast)
-                .filter(|if_expr| {
-                    matches!(
-                        if_expr.condition(),
-                        Some(ast::Expr::Literal(literal))
-                            if literal.syntax().text() == "true"
-                    )
-                })
-                .filter_map(|if_expr| {
-                    if_expr
-                        .then_branch()
-                        .and_then(|branch| branch.stmt_list())
-                        .and_then(|statements| statements.l_curly_token())
-                        .map(|token| token.text_range().end())
-                })
-                .collect::<Vec<_>>();
-
-            if offsets.is_empty() {
-                return Ok(output);
-            }
-
-            let (analysis, file_id) = Analysis::from_single_file(
-                output.clone(),
-                proc_macro_cwd.clone().into(),
-            );
-            let mut combined_edit = TextEdit::default();
+            let mut pending = vec![parsed.tree().syntax().clone()];
+            let mut edits = TextEdit::builder();
             let mut changed = false;
 
-            for offset in offsets {
-                let edit = analysis
-                    .assists_with_fixes(
-                        &assist_config,
-                        &diagnostics_config,
-                        AssistResolveStrategy::All,
-                        FileRange {
-                            file_id,
-                            range: TextRange::empty(offset),
-                        },
-                    )
-                    .map_err(ExpandemError::wrap)?
-                    .into_iter()
-                    .find(|assist| assist.id.0 == "unwrap_branch")
-                    .and_then(|assist| assist.source_change)
-                    .and_then(|change| {
-                        change
-                            .get_source_and_snippet_edit(file_id)
-                            .map(|(edit, _)| edit.clone())
-                    });
-
-                let Some(edit) = edit
+            while let Some(node) = pending.pop() {
+                let delimiters = if let Some(parens) =
+                    ast::ParenExpr::cast(node.clone())
+                {
+                    parens
+                        .expr()
+                        .zip(node.parent())
+                        .filter(|(expr, parent)| {
+                            parens.attrs().next().is_none()
+                                && !expr.needs_parens_in_place_of(parent, &node)
+                        })
+                        .and_then(|_| {
+                            parens.l_paren_token().zip(parens.r_paren_token())
+                        })
+                }
+                else if let Some(parens) = ast::ParenType::cast(node.clone())
+                {
+                    parens
+                        .ty()
+                        .zip(node.parent())
+                        .filter(|(ty, parent)| !ty.needs_parens_in(parent))
+                        .and_then(|_| {
+                            parens.l_paren_token().zip(parens.r_paren_token())
+                        })
+                }
                 else {
-                    continue;
+                    None
                 };
-                if combined_edit.union(edit).is_ok() {
+
+                if let Some((left, right)) = delimiters {
+                    remove_delimiter(&mut edits, left);
+                    remove_delimiter(&mut edits, right);
                     changed = true;
+                    // Recheck nested parentheses against their new parent next pass.
+                }
+                else {
+                    pending.extend(node.children());
                 }
             }
 
             if !changed {
-                return Ok(output);
+                return output;
             }
-            combined_edit.apply(&mut output);
+            edits.finish().apply(&mut output);
         }
+    }
+
+    fn remove_delimiter(
+        edits: &mut ra_ap_ide_db::text_edit::TextEditBuilder,
+        token: SyntaxToken,
+    ) {
+        let separates_tokens = token
+            .prev_token()
+            .zip(token.next_token())
+            .is_some_and(|(left, right)| needs_separator(&left, &right));
+        if separates_tokens {
+            edits.replace(token.text_range(), " ".to_owned());
+        }
+        else {
+            edits.delete(token.text_range());
+        }
+    }
+
+    fn needs_separator(
+        left: &SyntaxToken,
+        right: &SyntaxToken,
+    ) -> bool {
+        if left.kind().is_trivia() || right.kind().is_trivia() {
+            return false;
+        }
+        let mut joined =
+            String::with_capacity(left.text().len() + right.text().len());
+        joined.push_str(left.text());
+        joined.push_str(right.text());
+        let lexed = LexedStr::new(Edition::CURRENT, &joined);
+        return !(0..lexed.len())
+            .any(|index| lexed.text_start(index) == left.text().len());
+    }
+
+    pub(super) fn simplify_path_prefixes(
+        mut output: String,
+        db: &mut RootDatabase,
+        file_id: FileId,
+    ) -> String {
+        db.set_file_text(file_id, &output);
+        let edits = ra_ap_hir::attach_db(&*db, || {
+            let sema = Semantics::new(db);
+            let root = sema.parse_guess_edition(file_id);
+            let mut edits = TextEdit::builder();
+
+            for path in root.syntax().descendants().filter_map(ast::Path::cast)
+            {
+                if path.parent_path().is_some() {
+                    continue;
+                }
+                let in_import = path
+                    .syntax()
+                    .ancestors()
+                    .any(|node| ast::Use::can_cast(node.kind()));
+                let mut last_segment = None;
+                for (index, segment) in path.segments().enumerate() {
+                    if index > 0 && in_import {
+                        break;
+                    }
+                    let stop = segment.generic_arg_list().is_some()
+                        || segment.type_anchor().is_some();
+                    last_segment = Some(segment);
+                    // Dropping generic arguments or a type anchor changes substitutions.
+                    if stop {
+                        break;
+                    }
+                }
+                let Some(mut segment) = last_segment
+                else {
+                    continue;
+                };
+                let Some(name) = segment.name_ref()
+                else {
+                    continue;
+                };
+                if name.syntax().text_range().start()
+                    == path.syntax().text_range().start()
+                {
+                    continue;
+                }
+                let Some(scope) = sema.scope(path.syntax())
+                else {
+                    continue;
+                };
+
+                loop {
+                    let Some(name) = segment.name_ref()
+                    else {
+                        break;
+                    };
+                    let prefix = TextRange::new(
+                        path.syntax().text_range().start(),
+                        name.syntax().text_range().start(),
+                    );
+                    if prefix.is_empty() {
+                        break;
+                    }
+                    let contains_comment = path
+                        .syntax()
+                        .descendants_with_tokens()
+                        .any(|element| {
+                            element.kind() == ra_ap_syntax::SyntaxKind::COMMENT
+                                && prefix.contains_range(element.text_range())
+                        });
+                    if !contains_comment {
+                        let suffix = &output[usize::from(prefix.end())
+                            ..usize::from(segment.syntax().text_range().end())];
+                        let candidate = ast::make::path_from_text(suffix);
+                        if let Some(resolution) =
+                            sema.resolve_path(&segment.parent_path())
+                            && scope.speculative_resolve(&candidate)
+                                == Some(resolution)
+                        {
+                            let separates_tokens = path
+                                .syntax()
+                                .first_token()
+                                .and_then(|token| token.prev_token())
+                                .zip(name.syntax().first_token())
+                                .is_some_and(|(left, right)| {
+                                    needs_separator(&left, &right)
+                                });
+                            if separates_tokens {
+                                edits.replace(prefix, " ".to_owned());
+                            }
+                            else {
+                                edits.delete(prefix);
+                            }
+                            break;
+                        }
+                    }
+                    let Some(previous) = segment
+                        .parent_path()
+                        .qualifier()
+                        .and_then(|path| path.segment())
+                    else {
+                        break;
+                    };
+                    segment = previous;
+                }
+            }
+
+            return edits.finish();
+        });
+        edits.apply(&mut output);
+        return output;
+    }
+
+    pub(super) fn unwrap_literal_true_branches(mut output: String) -> String {
+        let parsed = SourceFile::parse(&output, Edition::CURRENT);
+        let mut pending = vec![parsed.tree().syntax().clone()];
+        let mut edits = TextEdit::builder();
+
+        while let Some(node) = pending.pop() {
+            if let Some(if_expr) = ast::IfExpr::cast(node.clone())
+                && matches!(
+                    if_expr.condition(),
+                    Some(ast::Expr::Literal(literal))
+                        if literal.syntax().text() == "true"
+                )
+                && let Some(if_token) = if_expr.if_token()
+                && let Some(branch) = if_expr.then_branch()
+            {
+                // Keep the block's scope and any attributes before `if`.
+                edits.delete(TextRange::new(
+                    if_token.text_range().start(),
+                    branch.syntax().text_range().start(),
+                ));
+                let discarded = TextRange::new(
+                    branch.syntax().text_range().end(),
+                    if_expr.syntax().text_range().end(),
+                );
+                if !discarded.is_empty() {
+                    edits.delete(discarded);
+                }
+                // Do not collect overlapping edits inside a discarded else.
+                pending.push(branch.syntax().clone());
+            }
+            else {
+                pending.extend(node.children());
+            }
+        }
+
+        edits.finish().apply(&mut output);
+        return output;
     }
 
     fn selected_attribute_edits(
@@ -1073,7 +1196,7 @@ options:
       --skip-build-scripts       skip running build.rs scripts and proc macros.
       --skip-proc-macros         do not start the proc-macro server or expand proc macros.
       --proc-macro-srv <PATH>    path to rust-analyzer's proc-macro server.
-      --fix                      apply rust-analyzer fixes to expanded output.
+      --fix                      simplify branches, parentheses, and paths.
       --max-depth <N>            maximum expansion depth.
   -h, --help                     print help.
 
