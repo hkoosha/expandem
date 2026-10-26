@@ -18,15 +18,18 @@ expandem path/to/source.rs my_crate::some_macro
 # Expand std macros too
 expandem path/to/source.rs --include-std
 
-# Simplify expanded branches, parentheses, and path prefixes
+# Simplify expanded branches, return blocks, parentheses, and path prefixes
 expandem path/to/source.rs --fix
 ```
 
 `--fix` simplifies the expanded output without adding imports:
 
 - Removes literal `if true` conditions and their unreachable `else` branches,
-  including in `return` expressions and generated implementations. The selected
-  block keeps its scope and attributes; other conditions are unchanged.
+  including in `return` expressions and generated implementations. Required block
+  scope and attributes are preserved; other conditions are unchanged.
+- Removes redundant braces around single-expression `return` operands, including
+  blocks exposed by branch simplification. Blocks with statements, attributes, or
+  modifiers such as `unsafe`, `const`, and `async` are preserved.
 - Removes redundant expression and type parentheses while preserving precedence,
   required grouping, attributes, comments, and token boundaries.
 - Shortens path prefixes only when the shorter path resolves to the same item in
@@ -58,7 +61,7 @@ options:
       --skip-build-scripts       skip running Cargo for discovering build-script output and proc macros.
       --skip-proc-macros         do not start the proc-macro server or expand procedural macros.
       --proc-macro-srv <PATH>    path to rust-analyzer's proc-macro server.
-      --fix                      simplify branches, parentheses, and paths.
+      --fix                      simplify branches, return blocks, parentheses, and paths.
   -h, --help                     print help.
 ```
 

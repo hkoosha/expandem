@@ -36,7 +36,8 @@ pub struct Options {
     /// Skip starting a proc-macro server and loading procedural macros.
     pub skip_proc_macros: bool,
 
-    /// Simplify constant branches, redundant parentheses, and path prefixes.
+    /// Simplify constant branches, redundant return blocks and parentheses,
+    /// and path prefixes.
     pub fix: bool,
 
     /// Maximum nesting depth of selected macro expansions.
@@ -303,34 +304,8 @@ mod internal {
                     && node.parent().is_some_and(|parent| {
                         ast::ReturnExpr::can_cast(parent.kind())
                     })
-                    && block.modifier().is_none()
-                    && block.attrs_with_doc().next().is_none()
                 {
-                    block
-                        .stmt_list()
-                        .filter(|statements| {
-                            statements.attrs_with_doc().next().is_none()
-                                && statements.statements().next().is_none()
-                                && statements.tail_expr().is_some_and(|expr| {
-                                    expr.attrs_with_doc().next().is_none()
-                                        && match expr {
-                                            ast::Expr::BlockExpr(inner) => inner
-                                                .stmt_list()
-                                                .is_some_and(|statements| {
-                                                    statements
-                                                        .attrs_with_doc()
-                                                        .next()
-                                                        .is_none()
-                                                }),
-                                            _ => true,
-                                        }
-                                })
-                        })
-                        .and_then(|statements| {
-                            statements
-                                .l_curly_token()
-                                .zip(statements.r_curly_token())
-                        })
+                    redundant_return_block_delimiters(block)
                 }
                 else {
                     None
@@ -352,6 +327,32 @@ mod internal {
             }
             edits.finish().apply(&mut output);
         }
+    }
+
+    fn redundant_return_block_delimiters(
+        block: ast::BlockExpr
+    ) -> Option<(SyntaxToken, SyntaxToken)> {
+        if block.modifier().is_some() || block.attrs_with_doc().next().is_some()
+        {
+            return None;
+        }
+        let statements = block.stmt_list()?;
+        if statements.statements().next().is_some()
+            || statements.attrs_with_doc().next().is_some()
+        {
+            return None;
+        }
+        let expr = statements.tail_expr()?;
+        if expr.attrs_with_doc().next().is_some() {
+            return None;
+        }
+        // Inner attributes are allowed in a tail block, not a return operand.
+        if let ast::Expr::BlockExpr(inner) = expr
+            && inner.stmt_list()?.attrs_with_doc().next().is_some()
+        {
+            return None;
+        }
+        return statements.l_curly_token().zip(statements.r_curly_token());
     }
 
     fn remove_delimiter(
@@ -1229,7 +1230,7 @@ options:
       --skip-build-scripts       skip running build.rs scripts and proc macros.
       --skip-proc-macros         do not start the proc-macro server or expand proc macros.
       --proc-macro-srv <PATH>    path to rust-analyzer's proc-macro server.
-      --fix                      simplify branches, parentheses, and paths.
+      --fix                      simplify branches, return blocks, parentheses, and paths.
       --max-depth <N>            maximum expansion depth.
   -h, --help                     print help.
 
