@@ -262,12 +262,12 @@ mod internal {
     }
 
     pub(super) fn simplify_syntax(output: String) -> String {
-        let output = remove_redundant_parentheses(output);
+        let output = remove_redundant_delimiters(output);
         let output = unwrap_literal_true_branches(output);
-        return remove_redundant_parentheses(output);
+        return remove_redundant_delimiters(output);
     }
 
-    pub(super) fn remove_redundant_parentheses(mut output: String) -> String {
+    pub(super) fn remove_redundant_delimiters(mut output: String) -> String {
         loop {
             let parsed = SourceFile::parse(&output, Edition::CURRENT);
             let mut pending = vec![parsed.tree().syntax().clone()];
@@ -299,6 +299,39 @@ mod internal {
                             parens.l_paren_token().zip(parens.r_paren_token())
                         })
                 }
+                else if let Some(block) = ast::BlockExpr::cast(node.clone())
+                    && node.parent().is_some_and(|parent| {
+                        ast::ReturnExpr::can_cast(parent.kind())
+                    })
+                    && block.modifier().is_none()
+                    && block.attrs_with_doc().next().is_none()
+                {
+                    block
+                        .stmt_list()
+                        .filter(|statements| {
+                            statements.attrs_with_doc().next().is_none()
+                                && statements.statements().next().is_none()
+                                && statements.tail_expr().is_some_and(|expr| {
+                                    expr.attrs_with_doc().next().is_none()
+                                        && match expr {
+                                            ast::Expr::BlockExpr(inner) => inner
+                                                .stmt_list()
+                                                .is_some_and(|statements| {
+                                                    statements
+                                                        .attrs_with_doc()
+                                                        .next()
+                                                        .is_none()
+                                                }),
+                                            _ => true,
+                                        }
+                                })
+                        })
+                        .and_then(|statements| {
+                            statements
+                                .l_curly_token()
+                                .zip(statements.r_curly_token())
+                        })
+                }
                 else {
                     None
                 };
@@ -307,7 +340,7 @@ mod internal {
                     remove_delimiter(&mut edits, left);
                     remove_delimiter(&mut edits, right);
                     changed = true;
-                    // Recheck nested parentheses against their new parent next pass.
+                    // Recheck nested delimiters against their new parent next pass.
                 }
                 else {
                     pending.extend(node.children());

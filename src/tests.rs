@@ -2,7 +2,7 @@
 mod tests {
     use crate::internal::{
         macro_path_matches,
-        remove_redundant_parentheses,
+        remove_redundant_delimiters,
         simplify_path_prefixes,
         simplify_syntax,
         unwrap_literal_true_branches,
@@ -272,7 +272,7 @@ fn value(x: i32, y: i32, p: &i32, callable: Callable) {
     if(x > 0) { consume(x); }
 }
 "#;
-        let output = remove_redundant_parentheses(source.to_owned());
+        let output = remove_redundant_delimiters(source.to_owned());
         let original = SourceFile::parse(source, Edition::CURRENT);
         let parsed = SourceFile::parse(&output, Edition::CURRENT);
         assert!(original.errors().is_empty(), "{source}");
@@ -299,7 +299,7 @@ fn value(x: i32, y: i32, p: &i32, callable: Callable) {
     fn removes_type_parentheses_but_preserves_trait_object_bounds() {
         let source =
             "type Plain = (((u32))); type Object = &((dyn Trait + Send));";
-        let output = remove_redundant_parentheses(source.to_owned());
+        let output = remove_redundant_delimiters(source.to_owned());
         let original = SourceFile::parse(source, Edition::CURRENT);
         let parsed = SourceFile::parse(&output, Edition::CURRENT);
         assert!(parsed.errors().is_empty(), "{output}");
@@ -331,7 +331,7 @@ fn value(x: i32, y: i32, p: &i32, callable: Callable) {
     example!((untouched));
 }
 "#;
-        let output = remove_redundant_parentheses(source.to_owned());
+        let output = remove_redundant_delimiters(source.to_owned());
         let original = SourceFile::parse(source, Edition::CURRENT);
         let parsed = SourceFile::parse(&output, Edition::CURRENT);
         assert!(parsed.errors().is_empty(), "{output}");
@@ -358,6 +358,80 @@ fn value(x: i32, y: i32, p: &i32, callable: Callable) {
     }
 
     #[test]
+    fn removes_redundant_return_blocks() {
+        let source = r#"struct Counter(core::num::Wrapping<u32>);
+impl Counter {
+    fn try_map(value: u32) -> Result<Self, u32> {
+        return{Ok(Self(core::num::Wrapping(value)))};
+    }
+}
+fn nested(value: u32) -> u32 { return{{(value)}}; }
+fn commented(value: u32) -> u32 {
+    return{/* before */value/* after */};
+}
+"#;
+        let output = simplify_syntax(source.to_owned());
+        let parsed = SourceFile::parse(&output, Edition::CURRENT);
+        assert!(parsed.errors().is_empty(), "{output}");
+        let expressions = parsed
+            .tree()
+            .syntax()
+            .descendants()
+            .filter_map(ast::ReturnExpr::cast)
+            .map(|expr| expr.expr().unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(expressions[0], ast::Expr::CallExpr(_)));
+        assert!(matches!(expressions[1], ast::Expr::PathExpr(_)));
+        assert!(matches!(expressions[2], ast::Expr::PathExpr(_)));
+        let comments = parsed
+            .tree()
+            .syntax()
+            .descendants_with_tokens()
+            .filter(|token| token.kind() == ra_ap_syntax::SyntaxKind::COMMENT)
+            .map(|token| token.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(comments, ["/* before */", "/* after */"]);
+        assert_eq!(simplify_syntax(output.clone()), output);
+    }
+
+    #[test]
+    fn preserves_required_return_blocks() {
+        let source = r#"fn statements(value: u32) -> u32 {
+    return { let value = value + 1; value };
+}
+fn items() -> u32 { return { const VALUE: u32 = 1; VALUE }; }
+fn unit() { return { consume(); }; }
+fn empty() { return {}; }
+fn unsafe_value(pointer: *const u32) -> u32 { return unsafe { *pointer }; }
+fn constant() -> u32 { return const { 1 }; }
+fn future() -> impl Future<Output = u32> { return async move { 1 }; }
+fn fallible() -> Result<u32, ()> { return try { operation()? }; }
+fn labeled() -> u32 { return 'value: { break 'value 1 }; }
+fn outer() -> u32 { return { #[allow(unused)] { 1 } }; }
+fn inner() -> u32 { return { { #![allow(unused)] 1 } }; }
+fn documented() -> u32 { return { { //! keep scope
+    1 } }; }
+fn attributed_tail() -> u32 { return { #[allow(unused)] 1 }; }
+fn operand(value: u32) -> u32 { return { value } + 1; }
+fn unexpanded() { example!(return { untouched }); }
+"#;
+        let output = simplify_syntax(source.to_owned());
+        let original = SourceFile::parse(source, Edition::CURRENT);
+        let parsed = SourceFile::parse(&output, Edition::CURRENT);
+        assert!(
+            original.errors().is_empty(),
+            "{:?}\n{source}",
+            original.errors(),
+        );
+        assert!(parsed.errors().is_empty(), "{output}");
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        syntax_shape(original.tree().syntax(), &mut before);
+        syntax_shape(parsed.tree().syntax(), &mut after);
+        assert_eq!(before, after);
+    }
+
+    #[test]
     fn combines_parentheses_and_literal_branch_cleanup() {
         let source =
             "fn value() -> u32 { return (if ((true)) { ((1)) } else { 2 }); }";
@@ -368,6 +442,13 @@ fn value(x: i32, y: i32, p: &i32, callable: Callable) {
             ast::IfExpr::can_cast(node.kind())
                 || ast::ParenExpr::can_cast(node.kind())
         }));
+        let returned = parsed
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::ReturnExpr::cast)
+            .unwrap();
+        assert!(matches!(returned.expr(), Some(ast::Expr::Literal(_))));
     }
 
     fn simplified_paths(fixture: &str) -> SourceFile {
